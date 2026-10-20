@@ -14,7 +14,8 @@ sensors are in, irrigation timing and volume.
 ## Screenshots
 
 **Vineyard Data**, as a customer account sees it: block map, estate summary,
-insights and climate panels. Operators also see irrigation and labour panels.
+insights, climate panels, and soil moisture and temperature, which customers
+and operators both see. Operators also see irrigation and labour panels.
 
 ![Vineyard Data tab, customer view](docs/screenshots/vineyard.png)
 
