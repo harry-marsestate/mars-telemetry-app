@@ -11,14 +11,6 @@ to pick (berry maturity by block), how a vintage's weather compares with
 earlier ones, where labour hours and cost go by operation, and, once on-site
 sensors are in, irrigation timing and volume.
 
-## Screenshots
-
-<!-- SCREENSHOT 1: Vineyard Data tab (climate, soil and water, labour panels) -->
-
-<!-- SCREENSHOT 2: Winery Data tab (fruit received, lot lab history, vessels) -->
-
-<!-- SCREENSHOT 3: Chat tab answering a question with a tool result -->
-
 ## Architecture
 
 **Data sources.**
