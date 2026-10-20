@@ -6,8 +6,7 @@ in `seed-data/blocks.csv`). It brings climate, soil, irrigation, labour, lab
 and cellar data for the 2022–2026 vintages into one place. Before it, this
 data sat in InnoVint, Excel spreadsheets and PDF lab reports. The vineyard
 team uses it today, and winery staff are planned users. Operators see
-everything; wine club members can have customer accounts that show only the
-blocks linked to their account. It supports decisions on when fruit is ready
+everything; wine club members can have customer accounts that exclude sensitive financial and lab data. It supports decisions on when fruit is ready
 to pick (berry maturity by block), how a vintage's weather compares with
 earlier ones, where labour hours and cost go by operation, and, once on-site
 sensors are in, irrigation timing and volume.
