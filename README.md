@@ -11,6 +11,23 @@ to pick (berry maturity by block), how a vintage's weather compares with
 earlier ones, where labour hours and cost go by operation, and, once on-site
 sensors are in, irrigation timing and volume.
 
+## Screenshots
+
+**Vineyard Data**, as a customer account sees it: block map, estate summary,
+insights and climate panels. Operators also see irrigation and labour panels.
+
+![Vineyard Data tab, customer view](docs/screenshots/vineyard.png)
+
+**Winery Data**, operator view: cellar conditions (simulated sensors),
+insights, lot lab history and vessel inventory.
+
+![Winery Data tab, operator view](docs/screenshots/winery.png)
+
+**Chat**, operator view: an answer about growing degree days, with the
+figures computed by the tools.
+
+![Chat tab, operator view](docs/screenshots/chat.png)
+
 ## Architecture
 
 **Data sources.**
