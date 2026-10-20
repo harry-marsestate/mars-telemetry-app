@@ -1,6 +1,6 @@
 # Mars Telemetry
 
-Mars Telemetry is a web dashboard and chat assistant for Mars Estate, a
+Mars Telemetry is a web application and chat assistant for Mars Estate, a
 vineyard and winery on Howell Mountain with three vineyard blocks (7.35 acres
 in `seed-data/blocks.csv`). It brings climate, soil, irrigation, labour, lab
 and cellar data for the 2022–2026 vintages into one place. Before it, this
