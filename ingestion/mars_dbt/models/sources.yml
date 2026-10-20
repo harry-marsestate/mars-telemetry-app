@@ -1,0 +1,12 @@
+version: 2
+
+sources:
+  - name: raw
+    schema: public
+    tables:
+      - name: sensor_readings
+      - name: blocks
+      - name: vintages
+      - name: vintage_climate_calibration
+      - name: anomaly_thresholds
+      - name: metric_registry

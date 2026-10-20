@@ -1,0 +1,243 @@
+import "@supabase/functions-js/edge-runtime.d.ts";
+import { withSupabase } from "@supabase/server";
+import { summarizeClimate, withIngestionLog } from "../_shared/ingestion-log.ts";
+import {
+  archiveUrl, ELEVATION_M, fetchWindowEnd, fetchWithEndFallback, isEndDateOutOfRange, lastCompletePacificDay,
+  harvestVintage, lastElapsedHourMs, stampUtc, vintageRanges,
+  CLIMATE_SOURCES, type ClimateSource, requestedModel,
+} from "./window.ts";
+
+// Daily real-2026-climate ingestion. Ports ingestion/open_meteo/client.py +
+// backfill_phase1.py/backfill_climate_round2.py's fetch/scale/upsert logic
+// into a scheduled Edge Function (those scripts are one-time, hand-run
+// Python -- 2022-2025 only, by design; this is the always-2026, always-on
+// daily counterpart). Scope is deliberately narrower than the historical
+// backfill: air_temp, humidity, precipitation, soil_moisture, soil_temp
+// only. Solar/wind/irrigation/labour stay mock indefinitely (solar has no
+// real UI consumer yet, wind has no usable real source, irrigation/labour
+// are explicitly out of scope for this project -- see docs/SECURITY.md).
+//
+// pg_cron-only, same auth mode as insights-scan/notify-admin-approval
+// (server-to-server, secret key only).
+export default {
+  fetch: withSupabase({
+    // "secret:*": any of the project's secret keys. Bare "secret" accepts only
+    // the key NAMED "default", so a rotation to a new key failed with 401
+    // until code changed (docs/SECURITY.md, 2026-09-29). Every secret key
+    // carries the same full privilege, so accepting any is no weaker.
+    auth: ["secret:*"],
+  }, (req, ctx) => withIngestionLog(ctx, "ingest-climate-2026", () => sync(req, ctx), summarizeClimate)),
+};
+
+// The sync itself, unchanged. withIngestionLog (../_shared/ingestion-log.ts)
+// records one system_health.ingestion_runs row for every run, whatever
+// this returns or throws.
+// deno-lint-ignore no-explicit-any
+async function sync(req: Request, ctx: any): Promise<Response> {
+    try {
+      const body = await req.json().catch(() => ({}));
+      const { start_date, end_date, days_back } = body ?? {};
+
+      // Rolling window, anchored to the REAL wall-clock date the job
+      // actually runs on -- deliberately NOT MOCK_NOW (the frontend's
+      // fixed "2026-07-28" demo anchor). The models' real publication lag
+      // (ECMWF IFS: none; ERA5-Land, the soil source: ~5 days) is relative
+      // to true present, not this app's frozen season-in-progress
+      // narrative; and the whole point of this design (see the "as of"
+      // function below) is that the displayed real-data date is allowed to
+      // land wherever the data actually has coverage, not wherever the rest
+      // of the app pretends "now" is. Default 14 days back -- a safe window
+      // that self-heals: any hour not published yet on one run simply
+      // comes back null (skipped, not written) and gets picked up on a
+      // later run while it's still inside the trailing window; the same
+      // refetch picks up IFS's own revisions of its newest hours.
+      const end = end_date ? new Date(`${end_date}T00:00:00Z`) : new Date();
+      const start = start_date
+        ? new Date(`${start_date}T00:00:00Z`)
+        : new Date(end.getTime() - (Number(days_back) > 0 ? Number(days_back) : 14) * 86400000);
+      const startStr = start.toISOString().slice(0, 10);
+      const endStr = end.toISOString().slice(0, 10);
+
+      // Never store an hour that hasn't happened, and never aggregate a day
+      // that hasn't ended -- see window.ts. Applies to explicit
+      // start_date/end_date backfill requests too.
+      const runAt = new Date();
+      const cutoffMs = lastElapsedHourMs(runAt.getTime());
+      const refreshEnd = [endStr, lastCompletePacificDay(runAt)].sort()[0];
+      // start/end are Pacific dates; Open-Meteo is asked for UTC dates (see
+      // stampUtc), so fetch up to one extra UTC day to cover the Pacific
+      // evening of endStr -- capped at today (UTC), and retried once a day
+      // earlier if Open-Meteo still says out of range (fetchWithEndFallback).
+      // The cutoff above trims anything not yet elapsed.
+      const fetchEnd = fetchWindowEnd(endStr, runAt);
+
+      // Each hour's vintage follows the harvest-year rule (harvestVintage:
+      // Nov 1 Pacific starts next year's vintage). Guard, fail-loud: an hour
+      // whose vintage isn't in public.vintages is NOT written and the run
+      // reports an error naming it -- adding a vintage is a deliberate step.
+      const { data: vintageRows, error: vintageErr } = await ctx.supabaseAdmin.from("vintages").select("vintage");
+      if (vintageErr) throw new Error(`could not read public.vintages: ${vintageErr.message}`);
+      const knownVintages = new Set<number>((vintageRows ?? []).map((r: { vintage: number }) => Number(r.vintage)));
+      const results: Record<string, MetricResult> = {};
+
+      const weatherData = await fetchWithEndFallback(
+        (e) => fetchHourly(startStr, e, [...CLIMATE_SOURCES.weather.vars], CLIMATE_SOURCES.weather.model), fetchEnd, endStr);
+      if (weatherData.error) {
+        results.air_temp = { written: 0, nulls: 0, error: weatherData.error };
+        results.humidity = { written: 0, nulls: 0, error: weatherData.error };
+        results.precipitation = { written: 0, nulls: 0, error: weatherData.error };
+      } else {
+        await upsertMetric(ctx, results, cutoffMs, "air_temp", weatherData.data!, "temperature_2m", knownVintages, 1, CLIMATE_SOURCES.weather);
+        await upsertMetric(ctx, results, cutoffMs, "humidity", weatherData.data!, "relative_humidity_2m", knownVintages, 1, CLIMATE_SOURCES.weather);
+        await upsertMetric(ctx, results, cutoffMs, "precipitation", weatherData.data!, "precipitation", knownVintages, 1, CLIMATE_SOURCES.weather);
+      }
+
+      const soilData = await fetchWithEndFallback(
+        (e) => fetchHourly(startStr, e, [...CLIMATE_SOURCES.soil.vars], CLIMATE_SOURCES.soil.model), fetchEnd, endStr);
+      if (soilData.error) {
+        results.soil_moisture = { written: 0, nulls: 0, error: soilData.error };
+        results.soil_temp = { written: 0, nulls: 0, error: soilData.error };
+      } else {
+        // scale=100: ERA5-Land reports volumetric water content as a 0-1
+        // fraction; every consumer here (the mock data, soil_below_refill's
+        // threshold, the "% VWC" unit) expects 0-100 -- see client.py's
+        // matching comment.
+        await upsertMetric(ctx, results, cutoffMs, "soil_moisture", soilData.data!, "soil_moisture_0_to_7cm", knownVintages, 100, CLIMATE_SOURCES.soil);
+        await upsertMetric(ctx, results, cutoffMs, "soil_temp", soilData.data!, "soil_temperature_0_to_7cm", knownVintages, 1, CLIMATE_SOURCES.soil);
+      }
+
+      const anyWritten = Object.values(results).some((r) => r.written > 0);
+      let refreshError: string | undefined;
+      // One refresh per vintage the window touches (a window can straddle
+      // Nov 1); a vintage not in public.vintages had nothing written, so it
+      // is skipped here (its hours are already reported as an error).
+      const refreshed: { vintage: number; start: string; end: string }[] = [];
+      if (anyWritten && startStr <= refreshEnd) {
+        for (const r of vintageRanges(startStr, refreshEnd)) {
+          if (!knownVintages.has(r.vintage)) continue;
+          const { error } = await ctx.supabaseAdmin.rpc("refresh_daily_weather_range", {
+            p_vintage: r.vintage, p_start: r.start, p_end: r.end,
+          });
+          if (error) {
+            console.error("ingest-climate-2026: refresh_daily_weather_range failed", r, error);
+            refreshError = [refreshError, `${r.vintage}: ${error.message}`].filter(Boolean).join("; ");
+          } else {
+            refreshed.push(r);
+          }
+        }
+      }
+
+      const { data: asOf, error: asOfErr } = await ctx.supabaseAdmin.rpc("real_climate_as_of_2026");
+      if (asOfErr) console.error("ingest-climate-2026: could not read real_climate_as_of_2026", asOfErr);
+
+      const anyError = Object.values(results).some((r) => r.error) || !!refreshError;
+      return Response.json({
+        ok: !anyError,
+        window: {
+          start: startStr, end: endStr, stored_through: new Date(cutoffMs).toISOString(), daily_weather_through: refreshEnd,
+          fetch_end: { weather: weatherData.endUsed, soil: soilData.endUsed },
+          fetch_end_fallback: weatherData.fallback || soilData.fallback,
+          daily_weather_refreshed_ranges: refreshed,
+        },
+        results,
+        // What was actually requested, read back from the URLs the ingest
+        // builds -- P1's ingestion.climate.model_pinned fails if either is
+        // missing (best_match) or isn't the pinned model.
+        requested_models: {
+          weather: requestedModel(archiveUrl(startStr, fetchEnd, [...CLIMATE_SOURCES.weather.vars], CLIMATE_SOURCES.weather.model)),
+          soil: requestedModel(archiveUrl(startStr, fetchEnd, [...CLIMATE_SOURCES.soil.vars], CLIMATE_SOURCES.soil.model)),
+        },
+        daily_weather_refreshed: anyWritten && !refreshError,
+        refresh_error: refreshError ?? null,
+        real_as_of: asOf ?? null,
+      }, { status: anyError ? 207 : 200 });
+    } catch (err) {
+      // Whatever failed, however early -- log it and leave the DB (and
+      // therefore real_climate_as_of_2026()) exactly as the last
+      // successful run left it. Nothing here ever deletes or blanks a
+      // prior day's row, so a thrown error before any upsert runs is
+      // always safe to just log and return from.
+      console.error("ingest-climate-2026: unexpected error", err);
+      return Response.json({ ok: false, reason: "unexpected error", detail: String(err) }, { status: 500 });
+    }
+}
+
+
+interface OpenMeteoResponse {
+  elevation?: number;
+  utc_offset_seconds?: number;
+  hourly?: { time: string[]; [key: string]: unknown };
+}
+
+async function fetchHourly(
+  startDate: string, endDate: string, hourlyVars: string[], models?: string,
+): Promise<{ data?: OpenMeteoResponse; error?: string; outOfRange?: boolean }> {
+  try {
+    const resp = await fetch(archiveUrl(startDate, endDate, hourlyVars, models));
+    if (!resp.ok) {
+      const text = await resp.text();
+      return { error: `Open-Meteo ${resp.status}: ${text}`, outOfRange: isEndDateOutOfRange(resp.status, text) };
+    }
+    const data: OpenMeteoResponse = await resp.json();
+    if (data.elevation == null || Math.abs(data.elevation - ELEVATION_M) > 1) {
+      return { error: `elevation mismatch: got ${data.elevation}, expected ${ELEVATION_M} -- refusing to ingest` };
+    }
+    if (data.utc_offset_seconds !== 0) {
+      return { error: `utc_offset_seconds is ${data.utc_offset_seconds}, expected 0 for timezone=UTC -- refusing to ingest` };
+    }
+    return { data };
+  } catch (err) {
+    return { error: String(err) };
+  }
+}
+
+interface MetricResult { written: number; nulls: number; future_skipped?: number; unknown_vintage?: number; vintages?: number[]; error?: string }
+
+async function upsertMetric(
+  ctx: { supabaseAdmin: { from: (t: string) => any } },
+  results: Record<string, MetricResult>,
+  cutoffMs: number,
+  metricKey: string, data: OpenMeteoResponse, variable: string, knownVintages: Set<number>, scale: number,
+  source: ClimateSource,
+) {
+  try {
+    const times = data.hourly?.time ?? [];
+    const values = (data.hourly?.[variable] as (number | null)[] | undefined) ?? [];
+    const rows: { metric_key: string; sensor_id: string; block_id: null; tank_id: null; recorded_at: string; value: number; source_system: string; vintage: number }[] = [];
+    let nulls = 0, futureSkipped = 0, unknownVintage = 0;
+    const missing = new Set<number>(), written = new Set<number>();
+    for (let i = 0; i < times.length; i++) {
+      const recordedAt = stampUtc(times[i]);
+      if (Date.parse(recordedAt) > cutoffMs) { futureSkipped++; continue; }
+      // Harvest-year vintage; refuse (loudly) a vintage public.vintages lacks.
+      const vintage = harvestVintage(Date.parse(recordedAt));
+      if (!knownVintages.has(vintage)) { unknownVintage++; missing.add(vintage); continue; }
+      const v = values[i];
+      if (v == null) { nulls++; continue; }
+      written.add(vintage);
+      rows.push({
+        metric_key: metricKey, sensor_id: source.sensor_id, block_id: null, tank_id: null,
+        recorded_at: recordedAt, value: v * scale, source_system: source.source_system, vintage,
+      });
+    }
+    const vintageError = unknownVintage
+      ? `${unknownVintage} hour(s) belong to vintage ${[...missing].sort().join(", ")} (harvest-year rule), which is not in public.vintages -- NOT written; add the vintage (docs/SECURITY.md)`
+      : undefined;
+    const vintages = [...written].sort();
+    if (rows.length === 0) {
+      results[metricKey] = { written: 0, nulls, future_skipped: futureSkipped, unknown_vintage: unknownVintage, vintages, error: vintageError };
+      return;
+    }
+    const { error } = await ctx.supabaseAdmin.from("sensor_readings")
+      .upsert(rows, { onConflict: "metric_key,sensor_id,recorded_at" });
+    if (error) {
+      console.error(`ingest-climate-2026: upsert failed for ${metricKey}`, error);
+      results[metricKey] = { written: 0, nulls, future_skipped: futureSkipped, unknown_vintage: unknownVintage, vintages, error: error.message };
+      return;
+    }
+    results[metricKey] = { written: rows.length, nulls, future_skipped: futureSkipped, unknown_vintage: unknownVintage, vintages, error: vintageError };
+  } catch (err) {
+    console.error(`ingest-climate-2026: unexpected error upserting ${metricKey}`, err);
+    results[metricKey] = { written: 0, nulls: 0, error: String(err) };
+  }
+}

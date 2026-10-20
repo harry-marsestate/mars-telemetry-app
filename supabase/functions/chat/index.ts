@@ -1,0 +1,675 @@
+import "@supabase/functions-js/edge-runtime.d.ts";
+import { withSupabase } from "@supabase/server";
+import Anthropic from "@anthropic-ai/sdk";
+import { DomainReality, fetchDomainReality, runTool, TOOLS } from "./tools.ts";
+import { callerProfile, resolveDisplayName } from "./profile.ts";
+import { callKimi, KIMI_MODEL } from "./kimi.ts";
+import { currentVintage, vintageContext } from "../_shared/vintage.ts";
+import { ANSWER_RULES } from "./query-rules.ts";
+import { checkChatInput, checkContentLength } from "./input-caps.ts";
+import { DASHBOARD_RULES, dashboardMap, GUIDE_TOOL, runGuideTool, type ThresholdRow } from "./dashboard-guide.ts";
+import { contextText, validateContext } from "./dashboard-context.ts";
+import { fetchLatestGdd, harvestBandPosition } from "./tools.ts";
+import { finishEvents } from "./finish-turn.ts";
+import { ANTHROPIC_MODEL } from "../_shared/anthropic-model.ts";
+
+// The chat's own tools: the shared data tools (also served by the MCP
+// gateway) plus the dashboard guide, which is chat-only.
+type RunAny = (name: string, input: Record<string, unknown>) => Promise<{ content: string; isError: boolean }>;
+const CHAT_TOOLS: Anthropic.Tool[] = [...TOOLS, GUIDE_TOOL];
+
+// RAG chat for Mars Estate/Mars Telemetry. ctx.supabase is RLS-scoped to the
+// caller's own JWT for every tool call -- deliberately never ctx.supabaseAdmin,
+// so a customer or pending user gets exactly the rows their role/RLS policies
+// already allow (including zero rows), the same way the rest of the app works.
+// Stateless: no conversation history persisted server-side -- the frontend
+// sends the full message history every call and appends what we return.
+//
+// Responds with Server-Sent Events, one JSON object per `data:` line:
+//   {type:"text",  text}                    incremental answer text
+//   {type:"tool",  text}                    status line before tools run
+//   {type:"done",  appended, truncated}     terminal, and the ONLY success signal
+//   {type:"error", message}                 failure after streaming began
+// A single JSON object per event rather than named SSE `event:` lines: the
+// client hand-parses this, and one shape is fewer edge cases than two.
+//
+// Measured before building this: 39-80% of a reply's wall clock (median 54%)
+// happens after the first text token, so streaming hides roughly half the
+// perceived wait without changing total generation time. That the Edge runtime
+// -- and specifically withSupabase({auth:["user"]}), not just a bare handler --
+// passes a ReadableStream through unbuffered was verified against the real auth
+// path with a throwaway probe (~1000ms client gaps from a server sleeping
+// 1000ms; 401 without a JWT), not assumed.
+// Runs Kimi's full tool loop in isolation, buffering every SSE event instead
+// of sending it immediately. The hard requirement (docs/SECURITY.md) is that
+// an operator on Kimi must never see a blank reply or a max_tokens failure --
+// tuning (reasoning_effort:"low", see kimi.ts) makes that rare, not
+// impossible, so nothing reaches the browser until the WHOLE attempt (every
+// tool iteration) is confirmed to have produced a genuine, complete answer. A
+// failure at any point -- truncation, a thrown error, a timeout -- discards
+// the buffer entirely; the caller re-runs the same question against Claude
+// from scratch. Partial Kimi tool results are deliberately never reused: a
+// failed run may have incomplete results, and correctness matters more than
+// the extra cost/latency of a clean re-run.
+type KimiAttempt =
+  | { ok: true; events: Record<string, unknown>[]; appended: Anthropic.MessageParam[] }
+  | { ok: false; reason: string };
+
+async function attemptKimi(
+  run: RunAny,
+  kimiApiKey: string,
+  systemPrompt: string,
+  conversation: Anthropic.MessageParam[],
+  maxIterations: number,
+): Promise<KimiAttempt> {
+  const events: Record<string, unknown>[] = [];
+  const newTurns: Anthropic.MessageParam[] = [];
+  let sawText = false;
+
+  try {
+    for (let i = 0; i < maxIterations; i++) {
+      const turn = await callKimi(kimiApiKey, systemPrompt, [...conversation, ...newTurns], { tools: CHAT_TOOLS });
+      console.log("chat: usage " + JSON.stringify({
+        turn: i,
+        provider: "kimi",
+        model: KIMI_MODEL,
+        input: turn.usage.input,
+        cache_read: turn.usage.cached,
+        cache_write: 0,
+        output: turn.usage.output,
+        thinking: turn.usage.reasoning,
+        stop: turn.stopReason,
+      }));
+
+      const content = turn.content;
+      const stopReason = turn.stopReason;
+      for (const b of content) {
+        if (b.type === "text" && b.text) {
+          // Text from a later model turn continues the same reply: keep a
+          // paragraph break between them ("data.I can't" otherwise).
+          const prev = events.findLast((e) => e.type === "text")?.text as string | undefined;
+          if (prev && !/\s$/.test(prev) && !/^\s/.test(b.text)) events.push({ type: "text", text: "\n\n" });
+          sawText = true;
+          events.push({ type: "text", text: b.text });
+        }
+      }
+      newTurns.push({ role: "assistant", content });
+
+      const toolUses = content.filter((b): b is Anthropic.ToolUseBlock => b.type === "tool_use");
+      if (stopReason === "tool_use" || (stopReason === "max_tokens" && toolUses.length)) {
+        const status = describeToolCalls(toolUses);
+        if (status) events.push({ type: "tool", text: status });
+
+        const toolResults: Anthropic.ToolResultBlockParam[] = [];
+        for (const block of toolUses) {
+          const result = await run(block.name, block.input as Record<string, unknown>);
+          toolResults.push({
+            type: "tool_result",
+            tool_use_id: block.id,
+            content: result.content,
+            is_error: result.isError,
+          });
+        }
+        newTurns.push({ role: "user", content: toolResults });
+        continue;
+      }
+
+      // A genuinely terminal turn. max_tokens here (no tool_use left to run)
+      // is exactly the answer-turn scratchpad-leak failure docs/SECURITY.md
+      // measured -- not something to show the operator, something to recover
+      // from via the fallback below.
+      if (stopReason === "max_tokens") return { ok: false, reason: "max_tokens" };
+      if (!sawText) return { ok: false, reason: "no_text" };
+      return { ok: true, events, appended: newTurns };
+    }
+    return { ok: false, reason: "max_iterations" };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { ok: false, reason: msg.includes("timed out") ? "timeout" : "error" };
+  }
+}
+
+export default {
+  fetch: withSupabase({ auth: ["user"] }, async (req, ctx) => {
+    try {
+      // Size caps before anything else (input-caps.ts). `code` lets the
+      // browser tell "start a new chat" apart from "shorten the question".
+      const lengthCap = checkContentLength(req.headers.get("content-length"));
+      if (!lengthCap.ok) return Response.json({ error: lengthCap.error, code: lengthCap.code }, { status: lengthCap.status });
+      const { messages, modelProvider, context: rawContext } = await req.json();
+      const inputCap = checkChatInput(messages);
+      if (!inputCap.ok) return Response.json({ error: inputCap.error, code: inputCap.code }, { status: inputCap.status });
+
+      // Resolved once per request via the same RLS-safe, SECURITY DEFINER
+      // RPC the frontend already uses for role display (getCurrentUserRole()).
+      // Folding it into the system prompt means the model knows up front
+      // whether operator-only tools will return real rows or honest
+      // emptiness, instead of discovering it tool-call by tool-call.
+      const { data: role, error: roleErr } = await ctx.supabase.rpc("current_role_name");
+      if (roleErr) {
+        console.error("chat: could not resolve caller role", roleErr);
+        return Response.json({ error: "could not resolve caller role" }, { status: 500 });
+      }
+
+      // The auth wrapper has already verified this identity. Never use a body
+      // user id or repeat auth.getUser() on its stateless database client.
+      const { data: profile, error: profileErr } = await callerProfile(ctx.supabase, ctx.userClaims);
+      if (profileErr) console.error("chat: could not resolve caller profile", profileErr);
+      const displayName = resolveDisplayName(role, profile?.first_name ?? null, profile?.last_name ?? null);
+      // real-only-data-mode project (2026-09-13): resolved once per
+      // request (not per tool call), same reasoning as `role` above.
+      // current_data_mode() (SECURITY DEFINER, keyed off auth.uid()
+      // inside the function body, mirroring current_role_name()'s exact
+      // pattern) rather than a raw table select -- no caller-supplied id
+      // needed, no RLS row-visibility ambiguity to have in the first
+      // place (see the profile query's own comment just above for what
+      // that ambiguity looks like when it isn't sidestepped). Defaults
+      // to 'all' on a missing/failed read, same fail-open-to-normal-
+      // behavior convention web/index.html's refreshDataMode() uses -- a
+      // transient failure here should never silently hide real data from
+      // a normal account.
+      const { data: dataModeResult, error: dataModeErr } = await ctx.supabase.rpc("current_data_mode");
+      if (dataModeErr) console.error("chat: could not resolve caller data_mode", dataModeErr);
+      const dataMode = dataModeResult || "all";
+      // domain_reality() is SECURITY DEFINER (see that migration) -- safe
+      // to call through ctx.supabase (RLS-scoped, never
+      // ctx.supabaseAdmin, per this file's own header comment) exactly
+      // like current_role_name() above; it answers a caller-independent
+      // question about the data itself, not anything RLS should filter.
+      const domainReality: DomainReality = await fetchDomainReality(ctx.supabase);
+
+      // CHAT_MODEL_PROVIDER is the deploy-time default (unset/anything but
+      // "kimi" fails safe onto what ships today). `modelProvider` on the
+      // request body is the Phase 2 operator toggle from web/index.html's
+      // model dropdown -- but it is client-controlled JSON, so it can only
+      // ever SELECT "kimi", never grant it: gated on `role`, the exact same
+      // check resolveDisplayName/buildSystemPrompt already use elsewhere in
+      // this function, resolved above via the SECURITY DEFINER
+      // current_role_name() RPC keyed off auth.uid(), not anything the caller
+      // supplied. A customer or pending account crafting
+      // `modelProvider:"kimi"` directly against this endpoint still gets
+      // "anthropic" -- confirmed live (docs/SECURITY.md), not just reasoned
+      // about, since the frontend hides the control but does not enforce it.
+      const deployProvider = Deno.env.get("CHAT_MODEL_PROVIDER") === "kimi" ? "kimi" : "anthropic";
+      const provider = modelProvider === "kimi" && role === "operator"
+        ? "kimi"
+        : modelProvider === "claude"
+          ? "anthropic"
+          : deployProvider;
+      const kimiApiKey = Deno.env.get("KIMI_API_KEY");
+      if (provider === "kimi" && !kimiApiKey) {
+        console.error("chat: CHAT_MODEL_PROVIDER=kimi but KIMI_API_KEY is unset");
+        return Response.json({ error: "chat backend is misconfigured" }, { status: 500 });
+      }
+
+      const anthropic = new Anthropic({ apiKey: Deno.env.get("ANTHROPIC_API_KEY") });
+
+      // anomaly_thresholds, read as the caller (the dashboard reads the same
+      // table), only when a guide entry is actually rendered this request.
+      let thresholdsP: Promise<ThresholdRow[] | null> | null = null;
+      const loadThresholds = () => thresholdsP ??= Promise.resolve(
+        ctx.supabase.from("anomaly_thresholds").select("rule_key, operator, threshold, rule_group, display_label, tooltip_phrase"),
+      ).then(({ data, error }: { data: ThresholdRow[] | null; error: unknown }) => {
+        if (error) console.error("chat: could not read anomaly_thresholds", error);
+        return error ? null : data;
+      });
+      // The current vintage's GDD against the harvest band, computed here
+      // (tools.ts harvestBandPosition) only when the GDD guide entry is used.
+      let bandP: Promise<string | null> | null = null;
+      const loadBandLine = () => bandP ??= fetchLatestGdd(ctx.supabase, currentVintage())
+        .then((latest) => JSON.stringify(harvestBandPosition(latest, currentVintage())), () => JSON.stringify(harvestBandPosition(null, currentVintage())));
+      const run: RunAny = (name, input) => name === GUIDE_TOOL.name
+        ? runGuideTool(input, role, domainReality, loadThresholds, loadBandLine)
+        : runTool(ctx.supabase, name, input, dataMode, domainReality);
+
+      const systemPrompt = buildSystemPrompt(role, displayName, dataMode, domainReality);
+      const conversation: Anthropic.MessageParam[] = messages.slice();
+
+      // Dashboard context (dashboard-context.ts): validated against role and
+      // accessible_blocks(), rendered here, and attached to THIS question as a
+      // second text block. The question turn as sent is returned in `done` so
+      // the browser's history holds exactly what the model saw.
+      if (rawContext) {
+        const { data: blockRows, error: blocksErr } = await ctx.supabase.rpc("accessible_blocks");
+        if (blocksErr) console.error("chat: accessible_blocks failed; no blocks named in context", blocksErr);
+        const accessible = blocksErr ? null : ((blockRows ?? []) as unknown[]).map((r) => typeof r === "string" ? r : (r as { accessible_blocks: string }).accessible_blocks);
+        const valid = validateContext(rawContext, role, accessible);
+        if (valid) {
+          const last = conversation[conversation.length - 1];
+          const text = typeof last.content === "string" ? last.content
+            : (last.content as Anthropic.ContentBlockParam[]).filter((b) => b.type === "text").map((b) => (b as Anthropic.TextBlockParam).text).join("\n");
+          conversation[conversation.length - 1] = { role: "user", content: [
+            { type: "text", text },
+            { type: "text", text: contextText(valid, role, domainReality, await loadThresholds(), valid.panel?.id === "gdd" ? await loadBandLine() : null) },
+          ] };
+        }
+      }
+      const userTurn = conversation[conversation.length - 1];
+      const newTurns: Anthropic.MessageParam[] = [];
+
+      // Bounds cost/latency on a single chat turn -- six round trips is far
+      // more than any legitimate question over this tool set should need.
+      const MAX_TOOL_ITERATIONS = 6;
+
+      // Everything above here can still fail as an ordinary JSON error response,
+      // because nothing has been streamed yet. Everything below runs inside the
+      // stream, where headers are already sent and the only way to report a
+      // failure is an `error` event.
+      const encoder = new TextEncoder();
+      const body = new ReadableStream({
+        async start(controller) {
+          const send = (event: Record<string, unknown>) =>
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+          let sawText = false;
+          let lastChar = ""; // last character streamed, across model turns
+          let usedFallback = false;
+
+          try {
+            if (provider === "kimi") {
+              const attempt = await attemptKimi(
+                run,
+                kimiApiKey as string,
+                systemPrompt,
+                conversation,
+                MAX_TOOL_ITERATIONS,
+              );
+              if (attempt.ok) {
+                for (const e of attempt.events) send(e);
+                // `provider` is the model that ACTUALLY answered, for
+                // web/index.html's per-message attribution tag -- always the
+                // real outcome, never the requested `modelProvider`, which is
+                // exactly why this is set here rather than echoed back from
+                // the request body.
+                send({ type: "done", appended: attempt.appended, truncated: false, provider: "kimi", user_turn: userTurn });
+                return;
+              }
+
+              // Mandatory fallback (docs/SECURITY.md): re-run the SAME
+              // question against Claude, from scratch, below -- capped at
+              // once per question by construction, since everything past
+              // this point is the plain, non-fallback Claude path (if Claude
+              // itself also fails, that's the existing honest-fallback/error
+              // handling already in this file, not a further retry loop).
+              // Logged with shape, not content, so real frequency is visible
+              // in production without putting question text in logs.
+              const lastMsg = conversation[conversation.length - 1];
+              console.error("chat: kimi failed, falling back to claude", {
+                reason: attempt.reason,
+                questionChars: typeof lastMsg?.content === "string"
+                  ? lastMsg.content.length
+                  : JSON.stringify(lastMsg?.content ?? "").length,
+                priorTurns: conversation.length,
+              });
+              usedFallback = true;
+            }
+
+            for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
+              const params: Anthropic.MessageStreamParams = {
+                model: ANTHROPIC_MODEL,
+                // Sonnet 5 and 5.5 both run adaptive thinking with no `thinking`
+                // param, and budget_tokens (the old way to reserve thinking
+                // separately) is REMOVED on both -- so thinking and the answer text
+                // compete for one shared max_tokens pool, with no way to partition it.
+                //
+                // `effort` is the lever that actually bounds thinking DEPTH, and it
+                // is doing the real work here -- not max_tokens. The figures below
+                // were measured on Sonnet 5; 5.5 recalibrates the effort levels, so
+                // its thinking at "low" was re-measured before the switch
+                // (docs/SECURITY.md, "Chat and narration moved to Claude Sonnet
+                // 5.5"). Measured live (throwaway operator, real data, this exact
+                // loop; 39 trials):
+                //   - At the old 2048 with default effort, a two-vintage comparison
+                //     spent the ENTIRE budget on thinking (2048/2048) and returned
+                //     no text at all.
+                //   - Raising max_tokens alone made it WORSE, not better: at 8000,
+                //     thinking simply expanded to fill the new ceiling (7,999 and
+                //     8,000 tokens observed), still returned blank on 2/11 trials,
+                //     and pushed one model call to 67.6s. The heaviest question
+                //     (5 vintages + a broad ask) failed 2/2 at 73.7s and 80.6s.
+                //     Adaptive thinking has no fixed appetite to "leave room" for.
+                //   - effort:"low" bounds it hard: peak thinking 0-400 tokens across
+                //     8 trials spanning every question shape, 0/8 truncated, and
+                //     two-vintage latency fell from 26-59s to 10.9-12.0s. The heavy
+                //     probe passed 2/2 at 22.3-27.5s, peaking at 896 thinking
+                //     tokens. Answer quality held: same three-part structure, same
+                //     figures (both effort levels independently reported 2024's GDD
+                //     ~27% above 2023's).
+                // 4000 is ~1.85x the largest total output ever observed under this
+                // config (2,156 tokens, heavy probe) -- real headroom without
+                // re-inviting the runaway. Step to effort:"medium" (measured: adds
+                // ~6-8s on two-vintage, still 0/6 truncated) if answers ever read as
+                // too shallow. The honest-fallback below stays as the backstop.
+                max_tokens: 4000,
+                system: [{ type: "text", text: systemPrompt, cache_control: { type: "ephemeral" } }],
+                tools: CHAT_TOOLS,
+                messages: withCacheBreakpoint([...conversation, ...newTurns]),
+              };
+
+              // `output_config.effort` postdates this project's pinned SDK types
+              // (@anthropic-ai/sdk ^0.70, which is 0.70.1 -- the field lands in the
+              // 0.124 types), but the API accepts and honors it today: verified by
+              // direct measurement, with a clean dose-response across the three
+              // levels (default -> 1,189-8,000 thinking tokens, medium -> 398-687,
+              // low -> 0-400). Cast here rather than bumping the SDK 54 minor
+              // versions under a live feature -- insights-scan shares the same pin.
+              // If that pin is ever raised, delete the cast and move the field into
+              // the typed object above.
+              const modelStream = anthropic.messages.stream(
+                { ...params, output_config: { effort: "low" } } as Anthropic.MessageStreamParams,
+              );
+
+              // finalMessage().usage DROPS output_tokens_details on this SDK
+              // version -- confirmed directly: the raw message_delta event carries
+              // {"output_tokens_details":{"thinking_tokens":33}} while
+              // finalMessage() reports no such field at all. docs/SECURITY.md's
+              // rule for this model says to verify thinking spend with exactly
+              // that field, so it has to be captured off the raw event or the
+              // check silently reports nothing forever.
+              let thinkingTokens = 0;
+              modelStream.on("streamEvent", (e) => {
+                if (e.type === "message_delta") {
+                  const t = (e.usage as { output_tokens_details?: { thinking_tokens?: number } } | undefined)
+                    ?.output_tokens_details?.thinking_tokens;
+                  if (typeof t === "number") thinkingTokens = t;
+                }
+              });
+              // Text is forwarded from every turn, not only the terminal one. In
+              // 39+ measured trials a tool_use turn emitted no text at all, so
+              // this is near-theoretical -- but if one ever does, showing what
+              // the model actually said beats the old behaviour of silently
+              // discarding it.
+              // The first text of a later model turn (after a tool round) gets a
+              // paragraph break if the reply so far didn't end in whitespace;
+              // otherwise the two turns ran together ("data.I can't").
+              let firstOfTurn = true;
+              modelStream.on("text", (delta: string) => {
+                if (!delta) return;
+                if (firstOfTurn && i > 0 && lastChar && !/\s/.test(lastChar) && !/^\s/.test(delta)) send({ type: "text", text: "\n\n" });
+                firstOfTurn = false;
+                sawText = true;
+                lastChar = delta.slice(-1);
+                send({ type: "text", text: delta });
+              });
+
+              const response = await modelStream.finalMessage();
+
+              // Counts only, no content. Cache effectiveness is invisible from the
+              // response body, and `cache_read_input_tokens` is the one field that
+              // separates "the breakpoint below is working" from "we are silently
+              // paying full price for the whole history on every turn" -- a
+              // regression there is otherwise completely silent. Logged per model
+              // turn so it is checkable in production, not only in a harness.
+              const usage = response.usage;
+              console.log("chat: usage " + JSON.stringify({
+                turn: i,
+                input: usage.input_tokens,
+                cache_read: usage.cache_read_input_tokens ?? 0,
+                cache_write: usage.cache_creation_input_tokens ?? 0,
+                output: usage.output_tokens,
+                thinking: thinkingTokens,
+                stop: response.stop_reason,
+              }));
+
+              const content: Anthropic.ContentBlockParam[] = response.content;
+              const stopReason: string | null = response.stop_reason;
+
+              newTurns.push({ role: "assistant", content });
+
+              const toolUses = content.filter(
+                (b): b is Anthropic.ToolUseBlock => b.type === "tool_use",
+              );
+
+              // A max_tokens cutoff that still contains tool_use blocks behaves
+              // like a normal tool_use turn, not a finished one: confirmed by
+              // direct reproduction against the API that a cutoff lands at (or
+              // just past) a tool_use block boundary, never mid-JSON -- the SDK
+              // only ever hands back complete, parseable tool_use blocks, even
+              // when one is missing a field the model didn't get to emit. Any
+              // such gap is already caught by each tool's own input validation
+              // in tools.ts (e.g. getSeries' bucket_hours check), which returns
+              // a normal is_error tool_result rather than throwing -- so it's
+              // safe to execute whatever calls did fit and loop for the rest,
+              // instead of discarding tool calls the model already committed to
+              // and silently returning nothing.
+              if (stopReason === "tool_use" || (stopReason === "max_tokens" && toolUses.length)) {
+                // Emitted only AFTER the model has committed to these calls, so
+                // the status names work genuinely about to run rather than a
+                // guess. Derived server-side rather than client-side on purpose:
+                // tool arguments are model-controlled text, and building the
+                // string here from whitelisted tokens only means no
+                // model-authored string ever reaches the browser in this event.
+                const status = describeToolCalls(toolUses);
+                if (status) send({ type: "tool", text: status });
+
+                const toolResults: Anthropic.ToolResultBlockParam[] = [];
+                for (const block of toolUses) {
+                  const result = await run(block.name, block.input as Record<string, unknown>);
+                  toolResults.push({
+                    type: "tool_result",
+                    tool_use_id: block.id,
+                    content: result.content,
+                    is_error: result.isError,
+                  });
+                }
+                newTurns.push({ role: "user", content: toolResults });
+                continue;
+              }
+
+              if (stopReason === "refusal") {
+                // Category only, never content (stop_details: Sonnet 5.5 docs).
+                console.error("chat: model declined", { category: (response as { stop_details?: { category?: string | null } }).stop_details?.category ?? null, turn: i });
+              } else if (!sawText) {
+                console.error("chat: model turn produced no usable text", {
+                  stop_reason: stopReason,
+                  blockTypes: content.map((b) => b.type),
+                });
+              }
+              // The no-text message, the fallback note and `done`
+              // (finish-turn.ts). `newTurns` goes back unedited.
+              for (const e of finishEvents({ newTurns, sawText, stopReason, usedFallback, userTurn })) send(e);
+              return;
+            }
+
+            send({ type: "error", message: "conversation needed too many tool calls to resolve" });
+          } catch (err) {
+            console.error("chat: stream failed", err);
+            send({ type: "error", message: "unexpected error" });
+          } finally {
+            controller.close();
+          }
+        },
+      });
+
+      return new Response(body, {
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          "Connection": "keep-alive",
+        },
+      });
+    } catch (err) {
+      console.error("chat: unexpected error", err);
+      return Response.json({ error: "unexpected error" }, { status: 500 });
+    }
+  }),
+};
+
+// Every token below is either a hardcoded label or a value that passed a
+// whitelist -- nothing the model wrote is ever interpolated into the status
+// line. An unrecognised tool, metric, block or vintage degrades to the plain
+// tool label (or is dropped entirely), never to a canned phrase describing work
+// that isn't happening.
+const TOOL_LABELS: Record<string, string> = {
+  get_derived_series: "climate data",
+  get_series: "sensor readings",
+  get_anomalies: "anomaly checks",
+  get_lot_analyses: "lab analyses",
+  get_vessels: "tank inventory",
+  get_labour_summary: "labour records",
+  get_berry_maturity: "berry maturity data",
+  get_smoke_markers: "smoke-taint markers",
+  get_wine_lab_results: "winery lab results",
+  get_dashboard_guide: "the dashboard guide",
+};
+const METRIC_LABELS: Record<string, string> = {
+  air_temp: "air temperature",
+  soil_moisture: "soil moisture",
+  soil_temp: "soil temperature",
+  humidity: "humidity",
+  wind_speed: "wind speed",
+  precip: "precipitation",
+  solar: "solar radiation",
+  uv: "UV",
+  irrigation_volume: "irrigation volume",
+};
+
+function joinList(xs: string[]): string {
+  if (xs.length <= 1) return xs[0] ?? "";
+  return `${xs.slice(0, -1).join(", ")} and ${xs[xs.length - 1]}`;
+}
+
+function describeToolCalls(blocks: Anthropic.ToolUseBlock[]): string | null {
+  // Grouped by tool so two get_derived_series calls read "climate data for 2022
+  // and 2023" rather than repeating the phrase once per call.
+  const groups = new Map<string, { vintages: Set<string>; scopes: Set<string>; metrics: Set<string> }>();
+  for (const b of blocks) {
+    const label = TOOL_LABELS[b.name];
+    if (!label) continue;
+    const input = (b.input ?? {}) as Record<string, unknown>;
+    const g = groups.get(label) ?? { vintages: new Set(), scopes: new Set(), metrics: new Set() };
+
+    const vintage = input.vintage;
+    if (typeof vintage === "number" && Number.isInteger(vintage) && vintage >= 2000 && vintage <= 2100) {
+      g.vintages.add(String(vintage));
+    }
+    const scope = input.block ?? input.block_id;
+    if (typeof scope === "string" && /^B[1-9]$/.test(scope)) g.scopes.add(scope);
+    const metric = input.metric;
+    if (typeof metric === "string" && METRIC_LABELS[metric]) g.metrics.add(METRIC_LABELS[metric]);
+
+    groups.set(label, g);
+  }
+  if (groups.size === 0) return null;
+
+  const parts: string[] = [];
+  for (const [label, g] of groups) {
+    const head = g.metrics.size ? joinList([...g.metrics]) : label;
+    const quals = [...g.scopes, ...g.vintages];
+    parts.push(quals.length ? `${head} for ${joinList(quals)}` : head);
+  }
+  return `Reading ${joinList(parts)}`;
+}
+
+// A second cache breakpoint, on the GROWING END of the conversation, alongside
+// the static one on the system block. The system breakpoint only ever covered
+// tools+system -- measured at 3,417 tokens, about 1.3% of what a real
+// conversation actually sends. Everything expensive is in `messages`: a single
+// get_derived_series tool_result is 35KB+, and because this function is
+// stateless the frontend replays the entire history on every question, so that
+// payload was re-sent and re-billed at full price on every later model turn AND
+// every later question.
+//
+// Measured over a real 4-turn conversation (throwaway operator, real data, this
+// exact loop): full-price input tokens 258,970 -> 12, cache reads 17,085 ->
+// 220,030, input-side cost down ~62% with cache writes counted at their 1.25x
+// rate rather than netted out. This is a COST lever, not a speed one -- wall
+// clock was indistinguishable, and the run that happened to be slower simply
+// generated 37% more output tokens.
+//
+// Built as an immutable copy on purpose. `newTurns` is handed back to the
+// frontend as `appended` and replayed verbatim on the next request, so
+// annotating a block in place would send our own breakpoint back to us next
+// turn; they would accumulate and eventually 400 against the API's limit of 4.
+// Nothing here writes to `conversation` or `newTurns`.
+//
+// Note the string -> block conversion below is only a shape change, not a
+// content change: the same user turn is sent as a bare string once it is no
+// longer last, and the cached prefix still matches (confirmed live -- an 85
+// token user message written to cache on one turn read back as part of a 3,502
+// token hit on the next).
+//
+// TTL caveat: `ephemeral` means 5 minutes. A user who leaves the tab idle
+// longer than that pays one fresh cache write on their next question and then
+// reads normally again -- the intended trade, not a regression.
+function withCacheBreakpoint(msgs: Anthropic.MessageParam[]): Anthropic.MessageParam[] {
+  if (!msgs.length) return msgs;
+  const cacheControl = { type: "ephemeral" as const };
+  const out = msgs.slice();
+  const last = out[out.length - 1];
+
+  if (typeof last.content === "string") {
+    out[out.length - 1] = {
+      ...last,
+      content: [{ type: "text", text: last.content, cache_control: cacheControl }],
+    };
+  } else if (Array.isArray(last.content) && last.content.length > 0) {
+    const blocks = last.content.slice();
+    const tail = blocks[blocks.length - 1];
+    // Only block types that can actually carry a breakpoint. In this loop the
+    // tail is always a tool_result (a tool turn) or a text block (the user
+    // question, converted above) -- but `thinking`/`redacted_thinking` are in
+    // the same union and cannot take cache_control, which tsc --strict
+    // correctly rejects. Anything else is left unmarked: no breakpoint is
+    // exactly the pre-change behaviour, so the fallback degrades to "no
+    // saving" rather than to a 400.
+    if (tail.type === "text" || tail.type === "tool_result") {
+      blocks[blocks.length - 1] = { ...tail, cache_control: cacheControl };
+      out[out.length - 1] = { ...last, content: blocks };
+    }
+  }
+  return out;
+}
+
+function buildSystemPrompt(role: string, displayName: string | null, dataMode: string, domainReality: DomainReality): string {
+  const shared = `You are a professional winemaker and viticulturist speaking on behalf of Mars Estate, a 7.35-acre Cabernet Sauvignon-dominant estate at roughly 2,200 ft on Howell Mountain, Napa Valley. You help estate operators and customers understand the vineyard and winery's real data -- climate, soil, irrigation, fermentation, lab chemistry, and harvest records -- by answering their questions using the tools available to you.
+
+Always structure your answer in three parts, in this order:
+
+1. Answer first. Open with a short, direct answer to what was asked and why it matters, in the voice described below for this user -- before the supporting detail.
+2. The detail. Bring in the specific data and metrics that support your answer -- real numbers, dates, blocks, and vintages from the tools you called, not generalities. This is where technical precision belongs.
+3. Takeaways. Close with what this means going forward -- a practical implication, a suggestion for what to look at next, or a natural follow-up question worth asking. Keep this brief and concrete to the actual finding, not a generic closer.
+
+When discussing climate, soil, or farming metrics, connect them to what they plausibly mean for the resulting wine -- ripening pace, acid and tannin development, canopy stress, disease pressure, expected style -- not just the numbers themselves. For customers, this connection should be a substantial part of the answer, not an afterthought; they're asking about their wine, not a weather report. Always ground this in the specific data returned -- describe tendencies the conditions suggest, not a definitive claim about how the finished wine tastes, and never invent tasting notes not supportable by the data.
+
+You only ever know what your tools return. If a tool returns no data for a question, say so plainly and suggest a nearby question that might have an answer, rather than guessing or filling the gap with something plausible-sounding. Never state a number, date, or finding that didn't come from a tool call -- and a number you derive yourself (a rate, difference, average or total) did not come from a tool call.
+
+${ANSWER_RULES}
+
+Connecting conditions to what they plausibly mean for the wine (above) is a statement about tendencies going forward; it is never licence to explain WHY a measured value changed.
+
+- Never answer general knowledge questions unrelated to Mars Estate.
+- Never use your own training knowledge to answer a question you could instead answer via a tool -- always call a tool first.
+- When asked about likely wine characteristics, ground your answer in real climate/chemistry data via tools and general winemaking principles, but be clear you're describing likely tendencies based on growing conditions, not a definitive claim about the finished wine's taste. Never invent tasting notes not supportable by data.
+- If asked something entirely unrelated to Mars Estate, politely decline and redirect to what you can help with.`;
+
+  const nameNote = displayName
+    ? ` The user's name is ${displayName}; address them by name naturally where it fits, not in every message.`
+    : "";
+
+  const toneBlock = role === "operator"
+    ? `This user is an operator (team member).${nameNote} Be direct and technical. Lead with the data -- figures, comparisons, specific numbers -- before commentary; don't preface with pleasantries. Assume vineyard/winery domain fluency: don't explain what GDD or VPD are unless asked. Offer a proactive next step when relevant (e.g. "want me to compare this to last vintage?"), but keep it to one line.`
+    : `This user is a customer (an Obsidian Member).${nameNote} Write the way a knowledgeable host at the estate would speak to a valued guest -- warm, genuine, and precise, never corporate or over-eager. Lead every answer with a short, plain-language explanation of what the data means for their wine and the estate; don't open with a wall of numbers or a bulleted data dump. Mention specific figures in service of that explanation, and offer to go deeper ("I can pull the exact soil moisture readings if you'd like") rather than front-loading them. If a term needs it, gloss it briefly in the same sentence ("GDD -- the heat the vines have banked this season -- is running..."), not as a separate definition. Avoid generic luxury-marketing language (no "exquisite," "indulge," "unparalleled," "crafted") -- the tone should read as genuinely knowledgeable, not like ad copy. If something isn't available at their access level, say so warmly and redirect rather than stating it as a bare restriction (e.g. "That's something our team tracks internally -- happy to walk through the estate's conditions or this vintage's story instead" rather than "That data is only available to operator accounts").`;
+
+  const accessNote = `\n\nTools backed by RLS policies enforce access automatically -- get_lot_analyses, get_vessels, get_labour_summary, get_berry_maturity, get_smoke_markers, and get_wine_lab_results are operator-only and will return zero rows for a customer or pending user. Don't call an operator-only tool for a non-operator and then act surprised by the empty result -- you already know their role from this prompt.`;
+
+  // real-only-data-mode project (2026-09-13). Only added when it applies
+  // -- the existing "you only know what your tools return, say so
+  // plainly" instruction above already covers a tool returning genuinely
+  // no data, but a real_only_mode_blocked result is a different case
+  // (data exists, but is withheld) that reads as an error or as missing
+  // data without this: without this note the model has no way to know
+  // that shape carries an explicit reason, not just an absence.
+  const realOnlyNote = dataMode === "real_only"
+    ? `\n\nThis account is set to real-data-only mode. Any tool result containing "real_only_mode_blocked": true means the data exists but is simulated, not real, and has been withheld because of this account's setting -- read its "message" field and explain that plainly (e.g. "cellar humidity is simulated data, and this account is set to show only real data, so I can't report a figure there"). Never describe that as "no data exists" or as an error -- it's neither. Note get_labour_summary, get_berry_maturity, get_smoke_markers, and get_wine_lab_results never return this shape: none of these four have any simulated data left (or ever existing) to withhold, so a vintage with no rows (e.g. 2022 for labour; 2022 for berry maturity/smoke markers) is a genuine, real absence -- describe it the normal "no data" way, not as real-only-mode withholding.`
+    : "";
+
+  // The date and current vintage come from the harvest-year rule at request
+  // time (_shared/vintage.ts), so "which vintage is current" is never a year
+  // written into this prompt.
+  // Dashboard guide (dashboard-guide.ts): the rules for explaining a panel,
+  // and the map of panels THIS role can see with each one's provenance. Role
+  // is the JWT-derived one resolved above; operator-only panels never appear
+  // in a customer's prompt.
+  const dashboard = `\n\n${DASHBOARD_RULES}\n\nDashboard map (current vintage ${currentVintage()}):\n${dashboardMap(role, domainReality)}`;
+  return `${shared}\n\n${vintageContext()}\n\n${toneBlock}${accessNote}${realOnlyNote}${dashboard}`;
+}

@@ -1,0 +1,5 @@
+email,full_name,role,customer_account_id
+alex@estate.example.com,Alex,operator,
+jordan@estate.example.com,Jordan Reyes,operator,
+buyer@northvalley.example.com,North Valley Wine Co.,customer,ACCT-01
+orders@ridgecellars.example.com,Ridge Cellars,customer,ACCT-02
