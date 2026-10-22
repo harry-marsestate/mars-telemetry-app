@@ -80,6 +80,8 @@ button{font-family:inherit; color:inherit; background:none; border:none; cursor:
   transition:border-color .18s, background .18s;
 }
 .avatar:hover{border-color:var(--gold-dim); background:var(--ink-4)}
+/* Blank until updateHeaderForSession() fills it; keeps its box, so no layout jump. */
+.avatar:empty{visibility:hidden}
 .menu{
   position:absolute; top:44px; right:0; width:224px; padding:14px;
   background:var(--ink-2); border:1px solid var(--line-2); border-radius:4px;
@@ -775,14 +777,12 @@ body[data-tab="chat"] .cw-launch, body[data-tab="chat"] .cw-win{display:none}
   <div class="hdr-right">
     <div class="clock" id="clock"></div>
     <div class="profile-wrap" id="pwrap">
-      <button class="avatar" id="avatar" aria-haspopup="true" aria-expanded="false" title="Account">OP</button>
+      <button class="avatar" id="avatar" aria-haspopup="true" aria-expanded="false" title="Account"></button>
       <div class="menu" id="menu" role="menu">
-        <div class="menu-name">Operator</div>
-        <div class="menu-role">Founder</div>
+        <div class="menu-name"></div>
+        <div class="menu-role"></div>
         <div class="menu-meta">
-          Mars Estate &middot; Howell Mountain<br>
-          Access: Vineyard + Winery<br>
-          Session opened 06:12 PDT
+          Mars Estate &middot; Howell Mountain
         </div>
         <button class="menu-link" id="menu-queue" role="menuitem" type="button" style="display:none">User Management</button>
         <button class="signout" id="signout" role="menuitem">Sign out</button>
